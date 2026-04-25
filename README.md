@@ -1,8 +1,8 @@
 # AnkiDroid Wear OS Companion
  
-A Wear OS companion app for [AnkiDroid](https://github.com/ankidroid/Anki-Android) that lets you review flashcards directly from your wrist — built as an MVP proof-of-concept.
+A Wear OS companion app for [AnkiDroid]([https://github.com/ankidroid/Anki-Android]) that lets you review flashcards directly from your wrist — built as an MVP proof-of-concept.
  
-> ⚠️ **This is an MVP / proof-of-concept.** It was built to validate the core data pipeline and watch-side rendering architecture. Code structure and practices reflect rapid prototyping, not production standards.
+> ⚠️ **This is an MVP / proof-of-concept.** It was built to validate the core data pipeline and watch-side rendering architecture. Code structure and practices reflect rapid prototyping, not production standards. To use this,you must use my fork for [AnkiDroid](https://github.com/Abhishek14104/Anki-Android)
  
 ---
  
