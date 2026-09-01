@@ -20,8 +20,17 @@ class AnkiViewModel : ViewModel() {
     private val _pendingGrades = MutableStateFlow(0)
     val pendingGrades: StateFlow<Int> = _pendingGrades.asStateFlow()
 
+    // Short human-readable note about the last sync attempt, shown on screen so
+    // failures aren't silent on a device with no other feedback.
+    private val _syncStatus = MutableStateFlow<String?>(null)
+    val syncStatus: StateFlow<String?> = _syncStatus.asStateFlow()
+
     fun setPendingGrades(count: Int) {
         _pendingGrades.value = count
+    }
+
+    fun setSyncStatus(message: String?) {
+        _syncStatus.value = message
     }
 
     fun updateCards(newCards: List<AnkiCard>) {

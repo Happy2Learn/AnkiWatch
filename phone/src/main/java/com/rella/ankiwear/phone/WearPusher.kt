@@ -34,6 +34,15 @@ class WearPusher(
         const val PATH_SYNC_REQUEST = "/wear/sync_request"
 
         private const val WATCH_CAPABILITY = "anki_watch_app"
+
+        /**
+         * Most cards to send to the watch in one sync.
+         *
+         * This is a ceiling, not a target: if fewer are due, the batch is just
+         * smaller. Kept bounded because the whole batch travels over Bluetooth
+         * and is held in memory on the watch.
+         */
+        const val SYNC_CARD_LIMIT = 50
     }
 
     /** Pushes the deck list (names + due counts) to the watch. */
@@ -57,7 +66,7 @@ class WearPusher(
 
     /** Pushes a batch of due cards to the watch. Returns how many were sent. */
     suspend fun pushCards(deckIds: List<Long>): Int {
-        val cards = anki.getDueCards(deckIds)
+        val cards = anki.getDueCards(deckIds, limit = SYNC_CARD_LIMIT)
         val json = JSONArray()
         cards.forEach { card ->
             json.put(JSONObject().apply {

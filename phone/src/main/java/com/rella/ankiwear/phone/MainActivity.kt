@@ -322,9 +322,9 @@ fun TestPanelScreen(
                         if (deckIds.isEmpty()) {
                             "No decks selected. Go back and check at least one deck."
                         } else {
-                            // Ask for more than the deck reports as due, so a
-                            // short result is meaningful rather than just our cap.
-                            val requested = 20
+                            // Same ceiling the real sync uses, so this test
+                            // reflects what the watch would actually receive.
+                            val requested = WearPusher.SYNC_CARD_LIMIT
                             val cards = anki.getDueCards(deckIds, limit = requested)
                             fetched = cards
                             gradeIndex = 0

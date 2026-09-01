@@ -52,6 +52,13 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
     private val FETCH_CARDS_PATH = "/wear/fetch_cards"
     private val RESPONSE_PATH = "/wear/deck_buffer"
     private val GRADES_ACK_PATH = "/wear/grades_ack"
+
+    /** Phone asking us to upload our queued grades. */
+    private val SYNC_REQUEST_PATH = "/wear/sync_request"
+
+    /** Us asking the phone to run a full sync. */
+    private val SYNC_NOW_PATH = "/wear/sync_now"
+
     private val TAG = "WearTest"
 
     private val viewModel: AnkiViewModel by viewModels()
@@ -60,6 +67,10 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
     // survive reboots and dead batteries.
     private val gradeQueue = mutableListOf<QueuedGrade>()
     private var cardShownAtMs: Long = 0L
+
+    // Batch timestamp of the card buffer we've already loaded, so re-reading
+    // stored data items doesn't clobber in-progress review state.
+    private var loadedBatchTime: Long = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -73,13 +84,16 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
             val isShowingFront by viewModel.isShowingFront.collectAsState()
             val pendingCount by viewModel.pendingGrades.collectAsState()
 
+            val syncMessage by viewModel.syncStatus.collectAsState()
+
             WearTestScreen(
                 cards = cards,
                 currentIndex = currentIndex,
                 isShowingFront = isShowingFront,
                 pendingGrades = pendingCount,
+                syncStatus = syncMessage,
                 onCardTap = { viewModel.flipToBack() },
-                onFetchClick = { requestFavoriteCards() },
+                onSyncClick = { syncNow() },
                 onGradeClick = { cardId, ease ->
                     recordGrade(cardId, ease)
                     viewModel.nextCard()
@@ -94,8 +108,44 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
         super.onResume()
         Wearable.getDataClient(this).addListener(this)
         cardShownAtMs = System.currentTimeMillis()
-        // If the phone is nearby, flush any queued grades right away.
-        CoroutineScope(Dispatchers.IO).launch { uploadGradeQueueIfPossible() }
+        CoroutineScope(Dispatchers.IO).launch {
+            // onDataChanged only fires for *live* changes. Anything the phone
+            // pushed while this app was closed is sitting in the data store
+            // unread, so pick it up explicitly on open.
+            readStoredDataItems()
+            // If the phone is nearby, flush any queued grades right away.
+            uploadGradeQueueIfPossible()
+        }
+    }
+
+    /**
+     * Reads card batches and acks that the phone already delivered.
+     *
+     * Without this, a batch pushed while the watch app was closed would be
+     * silently missed: DataClient stores it, but nothing would ever read it.
+     */
+    private suspend fun readStoredDataItems() {
+        try {
+            val items = Wearable.getDataClient(this).dataItems.await()
+            items.use { buffer ->
+                for (item in buffer) {
+                    val dataMap = DataMapItem.fromDataItem(item).dataMap
+                    when (item.uri.path) {
+                        RESPONSE_PATH ->
+                            dataMap.getString("cards_json")?.let { json ->
+                                val batchTime = dataMap.getLong("batch_time", 0L)
+                                cacheCardsJson(json)
+                                parseAndLoadCards(json, batchTime)
+                            }
+
+                        GRADES_ACK_PATH ->
+                            dataMap.getString("acked_ids")?.let { clearAckedGrades(it) }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to read stored data items", e)
+        }
     }
 
     override fun onPause() {
@@ -121,27 +171,34 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
     override fun onDataChanged(dataEvents: DataEventBuffer) {
         for (event in dataEvents) {
             if (event.type != DataEvent.TYPE_CHANGED) continue
+            val dataMap = DataMapItem.fromDataItem(event.dataItem).dataMap
             when (event.dataItem.uri.path) {
                 RESPONSE_PATH -> {
-                    val dataMap = DataMapItem.fromDataItem(event.dataItem).dataMap
                     val jsonString = dataMap.getString("cards_json") ?: continue
-
-                    CoroutineScope(Dispatchers.IO).launch {
-                        try {
-                            java.io.File(this@MainActivity.filesDir, "anki_cache.json")
-                                .writeText(jsonString)
-                        } catch (e: Exception) {
-                            Log.e(TAG, "❌ Failed to save to disk", e)
-                        }
-                    }
-                    parseAndLoadCards(jsonString)
+                    val batchTime = dataMap.getLong("batch_time", 0L)
+                    CoroutineScope(Dispatchers.IO).launch { cacheCardsJson(jsonString) }
+                    parseAndLoadCards(jsonString, batchTime)
                 }
+
                 GRADES_ACK_PATH -> {
-                    val dataMap = DataMapItem.fromDataItem(event.dataItem).dataMap
                     val acked = dataMap.getString("acked_ids") ?: continue
                     clearAckedGrades(acked)
                 }
+
+                // Phone tapped "Sync now": send it whatever we have queued.
+                SYNC_REQUEST_PATH -> {
+                    Log.d(TAG, "Phone requested our grade queue")
+                    CoroutineScope(Dispatchers.IO).launch { uploadGradeQueueIfPossible() }
+                }
             }
+        }
+    }
+
+    private fun cacheCardsJson(jsonString: String) {
+        try {
+            java.io.File(filesDir, "anki_cache.json").writeText(jsonString)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save cards to disk", e)
         }
     }
 
@@ -152,7 +209,16 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
         } catch (e: Exception) { false }
     }
 
-    private fun parseAndLoadCards(jsonString: String) {
+    /**
+     * @param batchTime the phone's timestamp for this batch. Batches we've
+     *   already loaded are ignored so re-reading stored data items doesn't
+     *   reset the user's place mid-review. Pass 0 to force a load.
+     */
+    private fun parseAndLoadCards(jsonString: String, batchTime: Long = 0L) {
+        if (batchTime != 0L && batchTime == loadedBatchTime) {
+            Log.d(TAG, "Ignoring already-loaded batch $batchTime")
+            return
+        }
         try {
             val jsonArray = JSONArray(jsonString)
             val gradedIds = gradeQueue.map { it.cardId }.toSet()
@@ -171,11 +237,20 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
                 // until the phone confirms them and sends a fresh batch.
                 if (card.id !in gradedIds) parsedList.add(card)
             }
+            loadedBatchTime = batchTime
+            val skipped = jsonArray.length() - parsedList.size
             CoroutineScope(Dispatchers.Main).launch {
                 viewModel.updateCards(parsedList)
+                viewModel.setSyncStatus(
+                    if (skipped > 0) "Got ${parsedList.size} cards ($skipped already graded)"
+                    else "Got ${parsedList.size} cards"
+                )
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to parse JSON", e)
+            CoroutineScope(Dispatchers.Main).launch {
+                viewModel.setSyncStatus("Couldn't read cards from phone")
+            }
         }
     }
 
@@ -252,6 +327,35 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
         sendMessageToPhone("/wear/grade_queue", json.toString().toByteArray())
     }
 
+    /**
+     * Full sync from the watch side: push our grades up, then ask the phone for
+     * a fresh batch. Requires the phone app to be open and in range.
+     */
+    private fun syncNow() {
+        viewModel.setSyncStatus("Syncing...")
+        CoroutineScope(Dispatchers.IO).launch {
+            val reachable = isPhoneReachable()
+            if (!reachable) {
+                CoroutineScope(Dispatchers.Main).launch {
+                    viewModel.setSyncStatus("Phone not found. Open the Anki app on your phone.")
+                }
+                return@launch
+            }
+            uploadGradeQueueIfPossible()
+            sendMessageToPhone(SYNC_NOW_PATH, ByteArray(0))
+        }
+    }
+
+    private suspend fun isPhoneReachable(): Boolean = try {
+        Wearable.getCapabilityClient(this)
+            .getCapability("anki_phone_app", CapabilityClient.FILTER_REACHABLE)
+            .await()
+            .nodes.isNotEmpty()
+    } catch (e: Exception) {
+        Log.e(TAG, "Could not check phone reachability", e)
+        false
+    }
+
     private fun clearAckedGrades(ackedIdsJson: String) {
         try {
             val array = JSONArray(ackedIdsJson)
@@ -268,6 +372,7 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
     // ---------- Outgoing requests ----------
 
     private fun requestFavoriteCards() {
+        viewModel.setSyncStatus("Asking phone for cards...")
         // Empty payload = "use the favorites configured on the phone".
         sendMessageToPhone(FETCH_CARDS_PATH, "{\"deckIds\":[]}".toByteArray())
     }
@@ -283,6 +388,13 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
                     .getCapability("anki_phone_app", CapabilityClient.FILTER_REACHABLE).await()
 
                 val targetNodes = capabilityInfo.nodes
+                if (targetNodes.isEmpty()) {
+                    Log.w(TAG, "No phone reachable for $path")
+                    CoroutineScope(Dispatchers.Main).launch {
+                        viewModel.setSyncStatus("Phone not found. Open the Anki app on your phone.")
+                    }
+                    return@launch
+                }
                 for (node in targetNodes) {
                     Wearable.getMessageClient(this@MainActivity)
                         .sendMessage(node.id, path, payload).await()
@@ -290,6 +402,9 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Message failed to send to $path", e)
+                CoroutineScope(Dispatchers.Main).launch {
+                    viewModel.setSyncStatus("Couldn't reach phone")
+                }
             }
         }
     }
@@ -301,8 +416,9 @@ fun WearTestScreen(
     currentIndex: Int,
     isShowingFront: Boolean,
     pendingGrades: Int,
+    syncStatus: String?,
     onCardTap: () -> Unit,
-    onFetchClick: () -> Unit,
+    onSyncClick: () -> Unit,
     onGradeClick: (Long, Int) -> Unit,
     onMediaClick: (Long) -> Unit
 ) {
@@ -314,7 +430,9 @@ fun WearTestScreen(
             if (cards.isEmpty()) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.padding(16.dp)
+                    modifier = Modifier
+                        .verticalScroll(rememberScrollState())
+                        .padding(16.dp)
                 ) {
                     if (pendingGrades > 0) {
                         Text(
@@ -325,7 +443,7 @@ fun WearTestScreen(
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            "$pendingGrades grade${if (pendingGrades == 1) "" else "s"} will sync\nwhen your phone is nearby.",
+                            "$pendingGrades grade${if (pendingGrades == 1) "" else "s"} waiting.\nOpen Anki on your phone, then Sync.",
                             color = Color.Gray,
                             fontSize = 12.sp,
                             textAlign = TextAlign.Center
@@ -334,7 +452,8 @@ fun WearTestScreen(
                         Text("No cards loaded.", color = Color.White)
                     }
                     Spacer(modifier = Modifier.height(8.dp))
-                    Button(onClick = onFetchClick) { Text("Fetch Batch") }
+                    Button(onClick = onSyncClick) { Text("Sync", fontSize = 12.sp) }
+                    SyncStatusText(syncStatus)
                 }
             } else if (currentIndex < cards.size) {
                 val currentCard = cards[currentIndex]
@@ -407,11 +526,24 @@ fun WearTestScreen(
                         )
                     }
                     Spacer(modifier = Modifier.height(8.dp))
-                    Button(onClick = onFetchClick) { Text("Fetch More") }
+                    Button(onClick = onSyncClick) { Text("Sync", fontSize = 12.sp) }
+                    SyncStatusText(syncStatus)
                 }
             }
         }
     }
+}
+
+@Composable
+private fun SyncStatusText(status: String?) {
+    if (status.isNullOrBlank()) return
+    Spacer(modifier = Modifier.height(6.dp))
+    Text(
+        status,
+        color = Color.Gray,
+        fontSize = 10.sp,
+        textAlign = TextAlign.Center
+    )
 }
 
 @Composable
