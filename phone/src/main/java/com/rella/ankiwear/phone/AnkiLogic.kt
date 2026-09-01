@@ -76,3 +76,27 @@ object MediaDetect {
  */
 fun orderGradesForReplay(grades: List<AnkiDroidHelper.Grade>): List<AnkiDroidHelper.Grade> =
     grades.sortedBy { it.reviewedAtMs }
+
+/**
+ * The user's chosen decks, stored in SharedPreferences.
+ *
+ * Kept in one place so the settings screen and the sync service can't drift
+ * apart on the preference file name or key.
+ */
+object FavoriteDecks {
+    private const val PREFS = "settings"
+    private const val KEY = "favorite_decks"
+
+    fun read(context: android.content.Context): List<Long> =
+        rawSet(context).mapNotNull { it.toLongOrNull() }
+
+    fun rawSet(context: android.content.Context): Set<String> =
+        prefs(context).getStringSet(KEY, emptySet()) ?: emptySet()
+
+    fun write(context: android.content.Context, ids: Set<String>) {
+        prefs(context).edit().putStringSet(KEY, ids).apply()
+    }
+
+    private fun prefs(context: android.content.Context) =
+        context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
+}
