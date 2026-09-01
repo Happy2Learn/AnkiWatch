@@ -48,6 +48,14 @@ class AnkiDroidHelper(private val context: Context) {
         private const val CARD_QUESTION = "question"
         private const val CARD_ANSWER = "answer"
 
+        // Cleaner variants: *_simple drops card styling (CSS), and answer_pure
+        // additionally strips AnkiDroid's question/answer separator and any
+        // repeated question text. Preferred for the watch; fall back to the
+        // plain columns if a given AnkiDroid version omits them.
+        private const val CARD_QUESTION_SIMPLE = "question_simple"
+        private const val CARD_ANSWER_PURE = "answer_pure"
+        private const val CARD_ANSWER_SIMPLE = "answer_simple"
+
         // Scheduler-state columns, used only for verifying that a grade landed.
         // Not all AnkiDroid versions expose every one of these, so they are
         // read defensively.
@@ -322,26 +330,45 @@ class AnkiDroidHelper(private val context: Context) {
         "cards/$ord"
     )
 
-    /** Reads one card's question/answer text via `notes/<noteId>/cards/<ord>`. */
+    /**
+     * Reads one card's question/answer text via `notes/<noteId>/cards/<ord>`.
+     *
+     * Requests every text variant and picks the cleanest available, then
+     * flattens HTML to plain text: the watch has no browser, so raw markup
+     * (e.g. `<hr id=answer>`) would otherwise show up on screen.
+     */
     private fun readCard(noteId: Long, ord: Int): DueCard? {
         val uri = cardUri(noteId, ord)
-        val cursor = context.contentResolver.query(
-            uri,
-            arrayOf(CARD_QUESTION, CARD_ANSWER),
-            null, null, null
-        ) ?: return null
+
+        // null projection = give us every column this version supports, so a
+        // missing *_simple / *_pure column can't fail the whole query.
+        val cursor = try {
+            context.contentResolver.query(uri, null, null, null, null)
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not read card $noteId/$ord", e)
+            null
+        } ?: return null
 
         return cursor.use {
             if (!it.moveToFirst()) return@use null
-            val question = it.getString(it.getColumnIndexOrThrow(CARD_QUESTION)) ?: ""
-            val answer = it.getString(it.getColumnIndexOrThrow(CARD_ANSWER)) ?: ""
+
+            val rawQuestion = it.optString(CARD_QUESTION_SIMPLE)
+                ?: it.optString(CARD_QUESTION) ?: ""
+            val rawAnswer = it.optString(CARD_ANSWER_PURE)
+                ?: it.optString(CARD_ANSWER_SIMPLE)
+                ?: it.optString(CARD_ANSWER) ?: ""
+
+            // Detect media before stripping: the markers are the evidence.
+            val frontHasMedia = MediaDetect.hasMedia(rawQuestion)
+            val backHasMedia = MediaDetect.hasMedia(rawAnswer)
+
             DueCard(
                 noteId = noteId,
                 cardOrd = ord,
-                front = question,
-                back = answer,
-                frontHasMedia = MediaDetect.hasMedia(question),
-                backHasMedia = MediaDetect.hasMedia(answer)
+                front = CardText.toPlain(rawQuestion),
+                back = CardText.toPlain(rawAnswer),
+                frontHasMedia = frontHasMedia,
+                backHasMedia = backHasMedia
             )
         }
     }
@@ -357,4 +384,11 @@ private fun Cursor.optInt(name: String): Int? {
 private fun Cursor.optLong(name: String): Long? {
     val i = getColumnIndex(name)
     return if (i >= 0 && !isNull(i)) getLong(i) else null
+}
+
+/** Reads a String column if the provider returned it non-blank, else null. */
+private fun Cursor.optString(name: String): String? {
+    val i = getColumnIndex(name)
+    if (i < 0 || isNull(i)) return null
+    return getString(i)?.takeIf { it.isNotBlank() }
 }

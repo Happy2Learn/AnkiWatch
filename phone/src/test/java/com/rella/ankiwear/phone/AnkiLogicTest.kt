@@ -91,6 +91,94 @@ class AnkiLogicTest {
         assertEquals(5, DeckCount.parse("[5, \"oops\"]"))
     }
 
+    // ---------- CardText ----------
+
+    @Test
+    fun `strips the anki answer separator`() {
+        // The exact markup that leaked onto the watch screen.
+        assertEquals("Paris", CardText.toPlain("<hr id=answer>Paris"))
+        assertEquals("Paris", CardText.toPlain("<hr id=\"answer\">Paris"))
+    }
+
+    @Test
+    fun `separator becomes a break when text surrounds it`() {
+        assertEquals(
+            "Capital of France\nParis",
+            CardText.toPlain("Capital of France<hr id=answer>Paris")
+        )
+    }
+
+    @Test
+    fun `converts br tags to newlines`() {
+        assertEquals("one\ntwo", CardText.toPlain("one<br>two"))
+        assertEquals("one\ntwo", CardText.toPlain("one<br/>two"))
+        assertEquals("one\ntwo", CardText.toPlain("one<BR />two"))
+    }
+
+    @Test
+    fun `removes style and script blocks entirely`() {
+        assertEquals(
+            "Answer",
+            CardText.toPlain("<style>.card { color: red; }</style>Answer")
+        )
+        assertEquals(
+            "Answer",
+            CardText.toPlain("<script>var x = 1;</script>Answer")
+        )
+    }
+
+    @Test
+    fun `decodes html entities`() {
+        assertEquals("a & b", CardText.toPlain("a &amp; b"))
+        assertEquals("5 < 10", CardText.toPlain("5 &lt; 10"))
+        assertEquals("a b", CardText.toPlain("a&nbsp;b"))
+    }
+
+    @Test
+    fun `strips remaining tags but keeps their text`() {
+        assertEquals("bold and italic", CardText.toPlain("<b>bold</b> and <i>italic</i>"))
+    }
+
+    @Test
+    fun `keeps cloze answer text`() {
+        assertEquals(
+            "The capital is Paris",
+            CardText.toPlain("The capital is <span class=\"cloze\">Paris</span>")
+        )
+    }
+
+    @Test
+    fun `removes sound markers`() {
+        assertEquals("Hello", CardText.toPlain("Hello [sound:greeting.mp3]"))
+    }
+
+    @Test
+    fun `collapses excess blank lines from block tags`() {
+        assertEquals(
+            "first\nsecond",
+            CardText.toPlain("<div>first</div><div><br></div><div>second</div>")
+        )
+    }
+
+    @Test
+    fun `plain text passes through unchanged`() {
+        assertEquals("Just a normal card", CardText.toPlain("Just a normal card"))
+    }
+
+    @Test
+    fun `handles blank input`() {
+        assertEquals("", CardText.toPlain(""))
+        assertEquals("", CardText.toPlain("   "))
+    }
+
+    @Test
+    fun `media is still detectable before stripping`() {
+        // Order matters: detect first, then strip. This documents why.
+        val html = "Listen [sound:a.mp3]"
+        assertTrue(MediaDetect.hasMedia(html))
+        assertFalse(MediaDetect.hasMedia(CardText.toPlain(html)))
+    }
+
     // ---------- MediaDetect ----------
 
     @Test

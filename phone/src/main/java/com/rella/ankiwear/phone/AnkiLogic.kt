@@ -55,6 +55,54 @@ object DeckCount {
     }
 }
 
+/**
+ * Turns card HTML into plain text suitable for a tiny watch screen.
+ *
+ * Anki card fields are HTML. Rendered raw, they leak markup like
+ * `<hr id=answer>` (AnkiDroid's question/answer separator) onto the screen.
+ * The watch has no browser, so we flatten to text on the phone and send only
+ * that.
+ *
+ * Media markers are stripped too — detect media BEFORE calling this, since the
+ * markers are what identify it.
+ */
+object CardText {
+    private val STYLE = Regex("(?is)<style.*?</style>")
+    private val SCRIPT = Regex("(?is)<script.*?</script>")
+    private val SOUND = Regex("(?i)\\[sound:[^]]*]")
+    private val LINE_BREAK = Regex("(?i)<(br|hr)[^>]*>")
+    private val BLOCK_END = Regex("(?i)</(div|p|li|tr|h[1-6]|blockquote)>")
+    private val CLOZE_HINT = Regex("(?i)<span class=\"?cloze\"?>(.*?)</span>")
+    private val BLANK_LINES = Regex("\n{2,}")
+
+    fun toPlain(html: String): String {
+        if (html.isBlank()) return ""
+
+        val withBreaks = html
+            .replace(STYLE, "")
+            .replace(SCRIPT, "")
+            .replace(SOUND, " ")
+            .replace(CLOZE_HINT, "$1")
+            .replace(LINE_BREAK, "\n")
+            .replace(BLOCK_END, "\n")
+
+        // Jsoup drops remaining tags and decodes entities (&amp;, &nbsp;, ...).
+        // wholeText() is used instead of text() because text() collapses the
+        // newlines we just inserted.
+        val text = org.jsoup.Jsoup.parse(withBreaks).wholeText()
+
+        // Blank lines are dropped rather than preserved: empty Anki fields and
+        // wrapper divs generate a lot of them, and vertical space is scarce on a
+        // watch screen.
+        return text
+            .lineSequence()
+            .map { it.replace('\u00A0', ' ').trim() }
+            .joinToString("\n")
+            .replace(BLANK_LINES, "\n")
+            .trim()
+    }
+}
+
 /** Detects whether card HTML embeds media (image/audio/video). */
 object MediaDetect {
     /**
