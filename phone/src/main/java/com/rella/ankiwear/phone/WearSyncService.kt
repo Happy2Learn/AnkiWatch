@@ -116,8 +116,12 @@ class WearSyncService : WearableListenerService() {
     private suspend fun applyAndAck(grades: List<AnkiDroidHelper.Grade>) {
         val ackedCardIds = mutableListOf<Long>()
         for (grade in orderGradesForReplay(grades)) {
-            if (anki.applyGrade(grade)) {
+            val result = anki.applyGrade(grade)
+            if (result.ok) {
                 ackedCardIds.add(CardCoding.encode(grade.noteId, grade.cardOrd))
+            } else {
+                // Not acked, so the watch keeps it and retries next sync.
+                Log.w(TAG, "Grade not applied for noteId=${grade.noteId}: ${result.error}")
             }
         }
         Log.d(TAG, "Applied ${ackedCardIds.size}/${grades.size} grades")

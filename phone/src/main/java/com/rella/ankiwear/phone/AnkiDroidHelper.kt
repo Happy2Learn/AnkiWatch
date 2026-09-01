@@ -3,7 +3,9 @@ package com.rella.ankiwear.phone
 import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
+import android.database.Cursor
 import android.net.Uri
+import android.util.Log
 import androidx.core.content.ContextCompat
 
 /**
@@ -33,6 +35,7 @@ class AnkiDroidHelper(private val context: Context) {
         // FlashCardsContract authority and paths (AnkiDroid API)
         private const val AUTHORITY = "com.ichi2.anki.flashcards"
         private val DECKS_URI: Uri = Uri.parse("content://$AUTHORITY/decks")
+        private val SELECTED_DECK_URI: Uri = Uri.parse("content://$AUTHORITY/selected_deck")
         private val NOTES_URI: Uri = Uri.parse("content://$AUTHORITY/notes")
         private val SCHEDULE_URI: Uri = Uri.parse("content://$AUTHORITY/schedule")
 
@@ -44,6 +47,18 @@ class AnkiDroidHelper(private val context: Context) {
         // Card columns (FlashCardsContract.Card)
         private const val CARD_QUESTION = "question"
         private const val CARD_ANSWER = "answer"
+
+        // Scheduler-state columns, used only for verifying that a grade landed.
+        // Not all AnkiDroid versions expose every one of these, so they are
+        // read defensively.
+        private const val CARD_REPS = "reps"
+        private const val CARD_LAPSES = "lapses"
+        private const val CARD_INTERVAL = "interval"
+        private const val CARD_RAW_DUE = "due"
+        private const val CARD_TYPE = "type"
+        private const val CARD_RAW_QUEUE = "queue"
+
+        private const val TAG = "AnkiDroidHelper"
 
         // ReviewInfo columns (FlashCardsContract.ReviewInfo)
         private const val REVIEW_NOTE_ID = "note_id"
@@ -76,6 +91,52 @@ class AnkiDroidHelper(private val context: Context) {
         // a "reviewed at" timestamp — it timestamps the review when applied.
         val reviewedAtMs: Long
     )
+
+    /**
+     * Result of a write-back attempt. Carries the failure reason instead of
+     * collapsing everything to a bare `false`, so problems are diagnosable.
+     */
+    data class GradeResult(
+        val ok: Boolean,
+        val rowsUpdated: Int,
+        val error: String? = null
+    )
+
+    /**
+     * A card's scheduler state. Used to verify a grade actually applied:
+     * if `reps` goes up, AnkiDroid really recorded a review.
+     *
+     * Fields are nullable because older AnkiDroid versions do not expose them.
+     */
+    data class CardState(
+        val reps: Int?,
+        val lapses: Int?,
+        val intervalDays: Int?,
+        val rawDue: Long?,
+        val type: Int?,
+        val queue: Int?
+    ) {
+        fun describe(): String = buildString {
+            append("reps=").append(reps ?: "?")
+            append("  lapses=").append(lapses ?: "?")
+            append("  interval=").append(intervalDays?.let { "${it}d" } ?: "?")
+            append("\ntype=").append(type?.let { typeName(it) } ?: "?")
+            append("  queue=").append(queue?.let { queueName(it) } ?: "?")
+            append("  due=").append(rawDue ?: "?")
+        }
+
+        private fun typeName(t: Int) = when (t) {
+            0 -> "new"; 1 -> "learning"; 2 -> "review"; 3 -> "relearning"
+            else -> "unknown($t)"
+        }
+
+        private fun queueName(q: Int) = when (q) {
+            -3 -> "buried(manual)"; -2 -> "buried(sibling)"; -1 -> "suspended"
+            0 -> "new"; 1 -> "learning"; 2 -> "review"; 3 -> "day-learn"
+            4 -> "preview"
+            else -> "unknown($q)"
+        }
+    }
 
     fun hasPermission(): Boolean =
         ContextCompat.checkSelfPermission(context, PERMISSION) ==
@@ -141,9 +202,10 @@ class AnkiDroidHelper(private val context: Context) {
      * Replays a single grade into AnkiDroid. AnkiDroid's own scheduler computes
      * the new interval — the watch never does scheduling math.
      *
-     * @return true if AnkiDroid accepted the review.
+     * Failures are logged and returned, not swallowed: a silent `false` here
+     * previously made write-back problems impossible to diagnose.
      */
-    fun applyGrade(grade: Grade): Boolean {
+    fun applyGrade(grade: Grade): GradeResult {
         return try {
             val values = ContentValues().apply {
                 put(REVIEW_NOTE_ID, grade.noteId)
@@ -152,9 +214,18 @@ class AnkiDroidHelper(private val context: Context) {
                 put(REVIEW_TIME_TAKEN, grade.timeTakenMs)
             }
             val rows = context.contentResolver.update(SCHEDULE_URI, values, null, null)
-            rows > 0
+            if (rows > 0) {
+                GradeResult(ok = true, rowsUpdated = rows)
+            } else {
+                val msg = "AnkiDroid reported 0 rows updated. The card may not be " +
+                    "the scheduler's current card, or it may no longer be due."
+                Log.w(TAG, "applyGrade: $msg (noteId=${grade.noteId} ord=${grade.cardOrd})")
+                GradeResult(ok = false, rowsUpdated = 0, error = msg)
+            }
         } catch (e: Exception) {
-            false
+            val msg = "${e::class.simpleName}: ${e.message}"
+            Log.e(TAG, "applyGrade threw (noteId=${grade.noteId} ord=${grade.cardOrd})", e)
+            GradeResult(ok = false, rowsUpdated = 0, error = msg)
         }
     }
 
@@ -162,9 +233,61 @@ class AnkiDroidHelper(private val context: Context) {
     fun applyGrades(grades: List<Grade>): List<Long> {
         val applied = mutableListOf<Long>()
         for (grade in orderGradesForReplay(grades)) {
-            if (applyGrade(grade)) applied.add(grade.noteId)
+            if (applyGrade(grade).ok) applied.add(grade.noteId)
         }
         return applied
+    }
+
+    /**
+     * Reads a card's scheduler state, for proving whether a grade applied.
+     *
+     * Requests the extended columns first and falls back to the default
+     * projection if this AnkiDroid version rejects them.
+     */
+    fun readCardState(noteId: Long, ord: Int): CardState? {
+        val uri = cardUri(noteId, ord)
+        val extended = arrayOf(
+            CARD_REPS, CARD_LAPSES, CARD_INTERVAL,
+            CARD_RAW_DUE, CARD_TYPE, CARD_RAW_QUEUE
+        )
+
+        val cursor = try {
+            context.contentResolver.query(uri, extended, null, null, null)
+        } catch (e: Exception) {
+            Log.w(TAG, "Extended card projection rejected; falling back", e)
+            try {
+                context.contentResolver.query(uri, null, null, null, null)
+            } catch (e2: Exception) {
+                Log.e(TAG, "Could not read card state", e2)
+                null
+            }
+        } ?: return null
+
+        return cursor.use {
+            if (!it.moveToFirst()) return@use null
+            CardState(
+                reps = it.optInt(CARD_REPS),
+                lapses = it.optInt(CARD_LAPSES),
+                intervalDays = it.optInt(CARD_INTERVAL),
+                rawDue = it.optLong(CARD_RAW_DUE),
+                type = it.optInt(CARD_TYPE),
+                queue = it.optInt(CARD_RAW_QUEUE)
+            )
+        }
+    }
+
+    /**
+     * Makes a deck the selected one in AnkiDroid.
+     *
+     * AnkiDroid's scheduler is deck-scoped, so answering a card can require
+     * that its deck is selected first.
+     */
+    fun selectDeck(deckId: Long): Boolean = try {
+        val values = ContentValues().apply { put(DECK_ID, deckId) }
+        context.contentResolver.update(SELECTED_DECK_URI, values, null, null) > 0
+    } catch (e: Exception) {
+        Log.e(TAG, "Could not select deck $deckId", e)
+        false
     }
 
     // ---------- Internals ----------
@@ -194,12 +317,14 @@ class AnkiDroidHelper(private val context: Context) {
         return result
     }
 
+    private fun cardUri(noteId: Long, ord: Int): Uri = Uri.withAppendedPath(
+        Uri.withAppendedPath(NOTES_URI, noteId.toString()),
+        "cards/$ord"
+    )
+
     /** Reads one card's question/answer text via `notes/<noteId>/cards/<ord>`. */
     private fun readCard(noteId: Long, ord: Int): DueCard? {
-        val uri = Uri.withAppendedPath(
-            Uri.withAppendedPath(NOTES_URI, noteId.toString()),
-            "cards/$ord"
-        )
+        val uri = cardUri(noteId, ord)
         val cursor = context.contentResolver.query(
             uri,
             arrayOf(CARD_QUESTION, CARD_ANSWER),
@@ -220,6 +345,16 @@ class AnkiDroidHelper(private val context: Context) {
             )
         }
     }
+}
 
+/** Reads an Int column if the provider returned it, else null. */
+private fun Cursor.optInt(name: String): Int? {
+    val i = getColumnIndex(name)
+    return if (i >= 0 && !isNull(i)) getInt(i) else null
+}
 
+/** Reads a Long column if the provider returned it, else null. */
+private fun Cursor.optLong(name: String): Long? {
+    val i = getColumnIndex(name)
+    return if (i >= 0 && !isNull(i)) getLong(i) else null
 }

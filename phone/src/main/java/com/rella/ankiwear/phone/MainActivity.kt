@@ -257,6 +257,9 @@ fun TestPanelScreen(
     var log by remember { mutableStateOf("Ready.") }
     var busy by remember { mutableStateOf(false) }
     var fetched by remember { mutableStateOf<List<AnkiDroidHelper.DueCard>>(emptyList()) }
+    // Which fetched card the grade test will act on. Advances after each grade
+    // so repeated taps don't hammer the same card.
+    var gradeIndex by remember { mutableStateOf(0) }
 
     fun run(label: String, block: suspend () -> String) {
         busy = true
@@ -319,18 +322,39 @@ fun TestPanelScreen(
                         if (deckIds.isEmpty()) {
                             "No decks selected. Go back and check at least one deck."
                         } else {
-                            val cards = anki.getDueCards(deckIds, limit = 5)
+                            // Ask for more than the deck reports as due, so a
+                            // short result is meaningful rather than just our cap.
+                            val requested = 20
+                            val cards = anki.getDueCards(deckIds, limit = requested)
                             fetched = cards
+                            gradeIndex = 0
+                            val reportedDue = anki.getDecks()
+                                .filter { it.deckId in deckIds }
+                                .sumOf { it.dueCount }
+
                             if (cards.isEmpty()) {
-                                "Fetched 0 cards. Either nothing is due, or the " +
-                                    "schedule query needs fixing."
+                                "Fetched 0 cards, but AnkiDroid reports " +
+                                    "$reportedDue due in the selected deck(s). " +
+                                    "The schedule query needs fixing."
                             } else {
                                 val first = cards.first()
-                                "Fetched ${cards.size} card(s).\n\n" +
-                                    "First card:\n" +
-                                    "  noteId=${first.noteId} ord=${first.cardOrd}\n" +
-                                    "  front: ${first.front.take(120)}\n" +
-                                    "  back: ${first.back.take(120)}"
+                                buildString {
+                                    append("Fetched ${cards.size} card(s) ")
+                                    append("(asked for $requested; AnkiDroid reports ")
+                                    append("$reportedDue due).\n")
+                                    if (cards.size < reportedDue && cards.size < requested) {
+                                        append(
+                                            "\nNote: fewer cards than reported due. " +
+                                                "The schedule endpoint returns only " +
+                                                "currently-answerable cards, so this " +
+                                                "can be normal.\n"
+                                        )
+                                    }
+                                    append("\nFirst card:\n")
+                                    append("  noteId=${first.noteId} ord=${first.cardOrd}\n")
+                                    append("  front: ${first.front.take(120)}\n")
+                                    append("  back: ${first.back.take(120)}")
+                                }
                             }
                         }
                     }
@@ -371,47 +395,106 @@ fun TestPanelScreen(
                         style = MaterialTheme.typography.titleSmall
                     )
                     Text(
-                        "It grades the first fetched card as \"Good\" in your real " +
-                            "collection and changes its schedule. Use a throwaway " +
-                            "deck if you'd rather not touch real cards. AnkiDroid's " +
-                            "Undo can reverse it.",
+                        "It grades one fetched card as \"Good\" in your real " +
+                            "collection and changes its schedule, then reports the " +
+                            "card's before/after state as proof. Each tap moves to " +
+                            "the next card. Use a throwaway deck if you'd rather not " +
+                            "touch real cards. AnkiDroid's Undo can reverse it.",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
             }
             Spacer(Modifier.height(8.dp))
             Button(
-                enabled = !busy && fetched.isNotEmpty(),
+                enabled = !busy && gradeIndex < fetched.size,
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.error
                 ),
                 onClick = {
-                    run("Grading one card") {
-                        val card = fetched.first()
-                        val grade = AnkiDroidHelper.Grade(
-                            noteId = card.noteId,
-                            cardOrd = card.cardOrd,
-                            ease = AnkiDroidHelper.EASE_GOOD,
-                            timeTakenMs = 3000,
-                            reviewedAtMs = System.currentTimeMillis()
+                    run("Grading card") {
+                        val card = fetched[gradeIndex]
+                        val deckIds = FavoriteDecks.read(context)
+
+                        // The scheduler is deck-scoped, so make sure the card's
+                        // deck is the selected one before answering.
+                        val selected = deckIds.firstOrNull()?.let { anki.selectDeck(it) }
+
+                        val before = anki.readCardState(card.noteId, card.cardOrd)
+                        val result = anki.applyGrade(
+                            AnkiDroidHelper.Grade(
+                                noteId = card.noteId,
+                                cardOrd = card.cardOrd,
+                                ease = AnkiDroidHelper.EASE_GOOD,
+                                timeTakenMs = 3000,
+                                reviewedAtMs = System.currentTimeMillis()
+                            )
                         )
-                        val ok = anki.applyGrade(grade)
-                        if (ok) {
-                            "SUCCESS: AnkiDroid accepted the review for " +
-                                "noteId=${card.noteId} ord=${card.cardOrd}.\n\n" +
-                                "Check the card's info in AnkiDroid to confirm a " +
-                                "new review was logged."
-                        } else {
-                            "FAILED: AnkiDroid rejected the review. The write-back " +
-                                "call or its column names need fixing."
+                        val after = anki.readCardState(card.noteId, card.cardOrd)
+                        gradeIndex += 1
+
+                        // reps going up is proof AnkiDroid actually logged a review.
+                        val repsBefore = before?.reps
+                        val repsAfter = after?.reps
+                        val proven = repsBefore != null && repsAfter != null &&
+                            repsAfter > repsBefore
+
+                        buildString {
+                            append("Card ${gradeIndex} of ${fetched.size}: ")
+                            append("noteId=${card.noteId} ord=${card.cardOrd}\n")
+                            append("deck selected: ")
+                            append(
+                                when (selected) {
+                                    true -> "yes"
+                                    false -> "failed"
+                                    null -> "no deck chosen"
+                                }
+                            )
+                            append("\n\n")
+
+                            append("API says: ")
+                            append(
+                                if (result.ok) "accepted (${result.rowsUpdated} row)"
+                                else "rejected"
+                            )
+                            result.error?.let { append("\n  $it") }
+                            append("\n\n")
+
+                            append("BEFORE  ").append(before?.describe() ?: "unavailable")
+                            append("\nAFTER   ").append(after?.describe() ?: "unavailable")
+                            append("\n\n")
+
+                            append(
+                                when {
+                                    proven ->
+                                        "VERIFIED: reps went $repsBefore -> $repsAfter. " +
+                                            "AnkiDroid really recorded the review."
+
+                                    repsBefore == null || repsAfter == null ->
+                                        "UNVERIFIED: this AnkiDroid version didn't " +
+                                            "expose the reps column, so the change " +
+                                            "can't be confirmed here. Check the card " +
+                                            "in AnkiDroid: Browse > tap card > Card Info."
+
+                                    result.ok ->
+                                        "SUSPICIOUS: the API said success but reps did " +
+                                            "not change ($repsBefore -> $repsAfter). " +
+                                            "The review likely did NOT apply."
+
+                                    else ->
+                                        "FAILED: no review was recorded."
+                                }
+                            )
                         }
                     }
                 }
             ) {
                 Text(
-                    if (fetched.isEmpty()) "4. Grade a card (fetch first)"
-                    else "4. Grade first card as Good"
+                    when {
+                        fetched.isEmpty() -> "4. Grade a card (fetch first)"
+                        gradeIndex >= fetched.size -> "4. All fetched cards graded"
+                        else -> "4. Grade card ${gradeIndex + 1} of ${fetched.size} as Good"
+                    }
                 )
             }
 
