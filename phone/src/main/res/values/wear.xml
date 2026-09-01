@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The watch looks for this name tag when it wants to talk to the phone. -->
+    <string-array name="android_wear_capabilities">
+        <item>anki_phone_app</item>
+    </string-array>
+</resources>

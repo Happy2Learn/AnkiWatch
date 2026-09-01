@@ -16,6 +16,14 @@ class AnkiViewModel : ViewModel() {
     private val _isShowingFront = MutableStateFlow(true)
     val isShowingFront: StateFlow<Boolean> = _isShowingFront.asStateFlow()
 
+    // How many grades are sitting on the watch waiting to upload to the phone
+    private val _pendingGrades = MutableStateFlow(0)
+    val pendingGrades: StateFlow<Int> = _pendingGrades.asStateFlow()
+
+    fun setPendingGrades(count: Int) {
+        _pendingGrades.value = count
+    }
+
     fun updateCards(newCards: List<AnkiCard>) {
         _cards.value = newCards
         _currentIndex.value = 0

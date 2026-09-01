@@ -21,4 +21,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "aa_companion"
 include(":app")
- 
+include(":phone")

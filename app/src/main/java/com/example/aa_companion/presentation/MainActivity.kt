@@ -38,37 +38,54 @@ data class AnkiCard(
     val backHasMedia: Boolean = false
 )
 
+/** One grade recorded on the watch, waiting to be uploaded to the phone. */
+data class QueuedGrade(
+    val cardId: Long,
+    val ease: Int,
+    val timeTakenMs: Long,
+    val reviewedAtMs: Long
+)
+
 class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
 
-    private val TEST_MESSAGE_PATH = "/wear/test-message"
+    private val FETCH_DECKS_PATH = "/wear/fetch_decks"
+    private val FETCH_CARDS_PATH = "/wear/fetch_cards"
     private val RESPONSE_PATH = "/wear/deck_buffer"
+    private val GRADES_ACK_PATH = "/wear/grades_ack"
     private val TAG = "WearTest"
 
     private val viewModel: AnkiViewModel by viewModels()
+
+    // Grades recorded while the phone is away, persisted on disk so they
+    // survive reboots and dead batteries.
+    private val gradeQueue = mutableListOf<QueuedGrade>()
+    private var cardShownAtMs: Long = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         loadCachedCardsOnBoot()
+        loadGradeQueueFromDisk()
 
         setContent {
             val cards by viewModel.cards.collectAsState()
             val currentIndex by viewModel.currentIndex.collectAsState()
             val isShowingFront by viewModel.isShowingFront.collectAsState()
+            val pendingCount by viewModel.pendingGrades.collectAsState()
 
             WearTestScreen(
                 cards = cards,
                 currentIndex = currentIndex,
                 isShowingFront = isShowingFront,
+                pendingGrades = pendingCount,
                 onCardTap = { viewModel.flipToBack() },
-                onFetchClick = { sendTestMessage() },
+                onFetchClick = { requestFavoriteCards() },
                 onGradeClick = { cardId, ease ->
-                    sendGrade(cardId, ease)
+                    recordGrade(cardId, ease)
                     viewModel.nextCard()
+                    cardShownAtMs = System.currentTimeMillis()
                 },
-                onMediaClick = { cardId ->
-                    sendMediaRequest(cardId)
-                }
+                onMediaClick = { cardId -> sendMediaRequest(cardId) }
             )
         }
     }
@@ -76,6 +93,9 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
     override fun onResume() {
         super.onResume()
         Wearable.getDataClient(this).addListener(this)
+        cardShownAtMs = System.currentTimeMillis()
+        // If the phone is nearby, flush any queued grades right away.
+        CoroutineScope(Dispatchers.IO).launch { uploadGradeQueueIfPossible() }
     }
 
     override fun onPause() {
@@ -83,13 +103,14 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
         Wearable.getDataClient(this).removeListener(this)
     }
 
+    // ---------- Card loading ----------
+
     private fun loadCachedCardsOnBoot() {
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val file = java.io.File(this@MainActivity.filesDir, "anki_cache.json")
                 if (file.exists()) {
-                    val jsonString = file.readText()
-                    parseAndLoadCards(jsonString)
+                    parseAndLoadCards(file.readText())
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to read from disk", e)
@@ -99,25 +120,31 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
 
     override fun onDataChanged(dataEvents: DataEventBuffer) {
         for (event in dataEvents) {
-            if (event.type == DataEvent.TYPE_CHANGED && event.dataItem.uri.path == RESPONSE_PATH) {
-                val dataMap = DataMapItem.fromDataItem(event.dataItem).dataMap
-                val jsonString = dataMap.getString("cards_json") ?: return
+            if (event.type != DataEvent.TYPE_CHANGED) continue
+            when (event.dataItem.uri.path) {
+                RESPONSE_PATH -> {
+                    val dataMap = DataMapItem.fromDataItem(event.dataItem).dataMap
+                    val jsonString = dataMap.getString("cards_json") ?: continue
 
-                CoroutineScope(Dispatchers.IO).launch {
-                    try {
-                        val file = java.io.File(this@MainActivity.filesDir, "anki_cache.json")
-                        file.writeText(jsonString)
-                    } catch (e: Exception) {
-                        Log.e(TAG, "❌ Failed to save to disk", e)
+                    CoroutineScope(Dispatchers.IO).launch {
+                        try {
+                            java.io.File(this@MainActivity.filesDir, "anki_cache.json")
+                                .writeText(jsonString)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "❌ Failed to save to disk", e)
+                        }
                     }
+                    parseAndLoadCards(jsonString)
                 }
-
-                parseAndLoadCards(jsonString)
+                GRADES_ACK_PATH -> {
+                    val dataMap = DataMapItem.fromDataItem(event.dataItem).dataMap
+                    val acked = dataMap.getString("acked_ids") ?: continue
+                    clearAckedGrades(acked)
+                }
             }
         }
     }
 
-    // Helper for robust boolean parsing
     private fun getSafeBool(json: JSONObject, key: String): Boolean {
         return try {
             val raw = json.get(key)
@@ -128,20 +155,21 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
     private fun parseAndLoadCards(jsonString: String) {
         try {
             val jsonArray = JSONArray(jsonString)
+            val gradedIds = gradeQueue.map { it.cardId }.toSet()
             val parsedList = mutableListOf<AnkiCard>()
 
             for (i in 0 until jsonArray.length()) {
                 val jsonObject = jsonArray.getJSONObject(i)
-
-                parsedList.add(
-                    AnkiCard(
-                        id = jsonObject.getLong("id"),
-                        front = jsonObject.getString("front"),
-                        back = jsonObject.getString("back"),
-                        frontHasMedia = getSafeBool(jsonObject, "frontHasMedia"),
-                        backHasMedia = getSafeBool(jsonObject, "backHasMedia")
-                    )
+                val card = AnkiCard(
+                    id = jsonObject.getLong("id"),
+                    front = jsonObject.getString("front"),
+                    back = jsonObject.getString("back"),
+                    frontHasMedia = getSafeBool(jsonObject, "frontHasMedia"),
+                    backHasMedia = getSafeBool(jsonObject, "backHasMedia")
                 )
+                // "Don't repeat": cards already graded on the watch are hidden
+                // until the phone confirms them and sends a fresh batch.
+                if (card.id !in gradedIds) parsedList.add(card)
             }
             CoroutineScope(Dispatchers.Main).launch {
                 viewModel.updateCards(parsedList)
@@ -151,20 +179,97 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
         }
     }
 
-    private fun sendTestMessage() {
-        sendMessageToPhone(TEST_MESSAGE_PATH, "Fetch Cards".toByteArray())
+    // ---------- Grade queue (offline-first) ----------
+
+    private fun recordGrade(cardId: Long, ease: Int) {
+        val timeTaken = (System.currentTimeMillis() - cardShownAtMs).coerceAtLeast(0)
+        val grade = QueuedGrade(cardId, ease, timeTaken, System.currentTimeMillis())
+        gradeQueue.add(grade)
+        viewModel.setPendingGrades(gradeQueue.size)
+        saveGradeQueueToDisk()
+        // Try to upload immediately; no-op if the phone is out of range.
+        CoroutineScope(Dispatchers.IO).launch { uploadGradeQueueIfPossible() }
     }
 
-    private fun sendGrade(cardId: Long, ease: Int) {
-        try {
-            val jsonPayload = org.json.JSONObject().apply {
-                put("id", cardId)
-                put("ease", ease)
-            }.toString().toByteArray()
-            sendMessageToPhone("/wear/answer_card", jsonPayload)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to build grade payload", e)
+    private fun gradeQueueFile() = java.io.File(filesDir, "grade_queue.json")
+
+    private fun saveGradeQueueToDisk() {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val json = JSONArray()
+                gradeQueue.forEach { g ->
+                    json.put(JSONObject().apply {
+                        put("id", g.cardId)
+                        put("ease", g.ease)
+                        put("timeTaken", g.timeTakenMs)
+                        put("reviewedAt", g.reviewedAtMs)
+                    })
+                }
+                gradeQueueFile().writeText(json.toString())
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to save grade queue", e)
+            }
         }
+    }
+
+    private fun loadGradeQueueFromDisk() {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val file = gradeQueueFile()
+                if (!file.exists()) return@launch
+                val array = JSONArray(file.readText())
+                for (i in 0 until array.length()) {
+                    val obj = array.getJSONObject(i)
+                    gradeQueue.add(
+                        QueuedGrade(
+                            cardId = obj.getLong("id"),
+                            ease = obj.getInt("ease"),
+                            timeTakenMs = obj.optLong("timeTaken", 0),
+                            reviewedAtMs = obj.optLong("reviewedAt", 0)
+                        )
+                    )
+                }
+                viewModel.setPendingGrades(gradeQueue.size)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load grade queue", e)
+            }
+        }
+    }
+
+    /** Sends the whole queue to the phone. The queue is only cleared after
+     *  the phone acks (see [clearAckedGrades]), so nothing is ever lost. */
+    private suspend fun uploadGradeQueueIfPossible() {
+        if (gradeQueue.isEmpty()) return
+        val json = JSONArray()
+        gradeQueue.forEach { g ->
+            json.put(JSONObject().apply {
+                put("id", g.cardId)
+                put("ease", g.ease)
+                put("timeTaken", g.timeTakenMs)
+                put("reviewedAt", g.reviewedAtMs)
+            })
+        }
+        sendMessageToPhone("/wear/grade_queue", json.toString().toByteArray())
+    }
+
+    private fun clearAckedGrades(ackedIdsJson: String) {
+        try {
+            val array = JSONArray(ackedIdsJson)
+            val acked = (0 until array.length()).map { array.getLong(it) }.toSet()
+            gradeQueue.removeAll { it.cardId in acked }
+            viewModel.setPendingGrades(gradeQueue.size)
+            saveGradeQueueToDisk()
+            Log.d(TAG, "Cleared ${acked.size} acked grades; ${gradeQueue.size} pending")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to clear acked grades", e)
+        }
+    }
+
+    // ---------- Outgoing requests ----------
+
+    private fun requestFavoriteCards() {
+        // Empty payload = "use the favorites configured on the phone".
+        sendMessageToPhone(FETCH_CARDS_PATH, "{\"deckIds\":[]}".toByteArray())
     }
 
     private fun sendMediaRequest(cardId: Long) {
@@ -195,6 +300,7 @@ fun WearTestScreen(
     cards: List<AnkiCard>,
     currentIndex: Int,
     isShowingFront: Boolean,
+    pendingGrades: Int,
     onCardTap: () -> Unit,
     onFetchClick: () -> Unit,
     onGradeClick: (Long, Int) -> Unit,
@@ -206,8 +312,27 @@ fun WearTestScreen(
             contentAlignment = Alignment.Center
         ) {
             if (cards.isEmpty()) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("No cards loaded.", color = Color.White)
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(16.dp)
+                ) {
+                    if (pendingGrades > 0) {
+                        Text(
+                            "All caught up!",
+                            color = Color.Green,
+                            textAlign = TextAlign.Center,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            "$pendingGrades grade${if (pendingGrades == 1) "" else "s"} will sync\nwhen your phone is nearby.",
+                            color = Color.Gray,
+                            fontSize = 12.sp,
+                            textAlign = TextAlign.Center
+                        )
+                    } else {
+                        Text("No cards loaded.", color = Color.White)
+                    }
                     Spacer(modifier = Modifier.height(8.dp))
                     Button(onClick = onFetchClick) { Text("Fetch Batch") }
                 }
@@ -247,47 +372,55 @@ fun WearTestScreen(
                             }
                         }
 
-                        // GRADING BUTTONS
+                        // GRADING BUTTONS — labeled, sized for round screens
                         if (!isShowingFront) {
                             Spacer(modifier = Modifier.height(16.dp))
                             Row(
                                 horizontalArrangement = Arrangement.SpaceEvenly,
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Button(
-                                    onClick = { onGradeClick(currentCard.id, 1) },
-                                    colors = ButtonDefaults.buttonColors(backgroundColor = Color.Red),
-                                    modifier = Modifier.size(36.dp)
-                                ) { Text("1", color = Color.White) }
-
-                                Button(
-                                    onClick = { onGradeClick(currentCard.id, 2) },
-                                    colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFFFFA500)),
-                                    modifier = Modifier.size(36.dp)
-                                ) { Text("2", color = Color.White) }
-
-                                Button(
-                                    onClick = { onGradeClick(currentCard.id, 3) },
-                                    colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF00AA00)),
-                                    modifier = Modifier.size(36.dp)
-                                ) { Text("3", color = Color.White) }
-
-                                Button(
-                                    onClick = { onGradeClick(currentCard.id, 4) },
-                                    colors = ButtonDefaults.buttonColors(backgroundColor = Color.Blue),
-                                    modifier = Modifier.size(36.dp)
-                                ) { Text("4", color = Color.White) }
+                                GradeButton("Again", Color(0xFFD32F2F)) { onGradeClick(currentCard.id, 1) }
+                                GradeButton("Hard", Color(0xFFFFA500)) { onGradeClick(currentCard.id, 2) }
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Row(
+                                horizontalArrangement = Arrangement.SpaceEvenly,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                GradeButton("Good", Color(0xFF00AA00)) { onGradeClick(currentCard.id, 3) }
+                                GradeButton("Easy", Color(0xFF1976D2)) { onGradeClick(currentCard.id, 4) }
                             }
                         }
                     }
                 }
             } else {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(16.dp)
+                ) {
                     Text("Deck Finished!", color = Color.Green, textAlign = TextAlign.Center)
+                    if (pendingGrades > 0) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            "$pendingGrades grade${if (pendingGrades == 1) "" else "s"} waiting to sync.",
+                            color = Color.Gray, fontSize = 12.sp, textAlign = TextAlign.Center
+                        )
+                    }
                     Spacer(modifier = Modifier.height(8.dp))
                     Button(onClick = onFetchClick) { Text("Fetch More") }
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun GradeButton(label: String, color: Color, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        colors = ButtonDefaults.buttonColors(backgroundColor = color),
+        modifier = Modifier.size(width = 72.dp, height = 40.dp)
+    ) {
+        Text(label, color = Color.White, fontSize = 12.sp)
     }
 }
