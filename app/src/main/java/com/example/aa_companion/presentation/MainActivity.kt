@@ -493,6 +493,15 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
             }
             uploadGradeQueueIfPossible()
             sendMessageToPhone(SYNC_NOW_PATH, ByteArray(0))
+
+            // Timeout after 8 seconds if phone has Sync OFF or does not reply
+            kotlinx.coroutines.delay(8000)
+            if (expectingSync) {
+                expectingSync = false
+                withContext(Dispatchers.Main) {
+                    viewModel.setSyncStatus("No reply. Make sure 'Allow Watch Sync' is ON on phone.")
+                }
+            }
         }
     }
 

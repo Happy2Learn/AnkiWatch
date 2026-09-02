@@ -72,6 +72,7 @@ fun SettingsScreen(
     val ankiInstalled = remember { anki.isAnkiDroidInstalled() }
     var decks by remember { mutableStateOf<List<AnkiDroidHelper.DeckInfo>>(emptyList()) }
     var loadingDecks by remember { mutableStateOf(false) }
+    var syncArmed by remember { mutableStateOf(SyncArm.isOn(context)) }
     var favorites by remember { mutableStateOf(FavoriteDecks.rawSet(context)) }
     var syncStatus by remember { mutableStateOf<String?>(null) }
     var syncing by remember { mutableStateOf(false) }
@@ -128,52 +129,34 @@ fun SettingsScreen(
 
             if (!hasPermission) return@Column
 
-            // ---------- Sync ----------
+            // ---------- Sync Switch ----------
             Spacer(Modifier.height(24.dp))
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp)) {
-                    Text("Sync with watch", style = MaterialTheme.typography.titleMedium)
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        "Open the Anki app on your watch, then tap Sync now.",
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    Spacer(Modifier.height(12.dp))
-                    Button(
-                        enabled = !syncing,
-                        onClick = {
-                            syncing = true
-                            syncStatus = "Syncing..."
-                            scope.launch {
-                                val result = withContext(Dispatchers.IO) {
-                                    if (!pusher.isWatchReachable()) {
-                                        "Watch not reachable. Is it nearby with the app open?"
-                                    } else {
-                                        // Ask the watch for its grades (they live
-                                        // there), and send down fresh cards.
-                                        pusher.requestGradesFromWatch()
-                                        val deckCount = pusher.pushDeckList()
-                                        val cardCount = pusher.pushCards(FavoriteDecks.read(context))
-                                        if (deckCount == 0) {
-                                            "No decks found."
-                                        } else if (cardCount == 0) {
-                                            "Sent 0 cards. Pick decks below, or nothing is due."
-                                        } else {
-                                            "Sent $cardCount cards. Grades will arrive shortly."
-                                        }
-                                    }
-                                }
-                                syncStatus = result
-                                reloadDecks()
-                                syncing = false
-                            }
-                        }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text(if (syncing) "Syncing..." else "Sync now")
-                    }
-                    syncStatus?.let {
-                        Spacer(Modifier.height(8.dp))
-                        Text(it, style = MaterialTheme.typography.bodySmall)
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Allow Watch Sync",
+                                style = MaterialTheme.typography.titleMedium
+                            )
+                            Text(
+                                if (syncArmed) "Ready: Watch can sync when requested"
+                                else "Paused: Phone ignores watch sync requests",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (syncArmed) MaterialTheme.colorScheme.primary
+                                        else MaterialTheme.colorScheme.outline
+                            )
+                        }
+                        Switch(
+                            checked = syncArmed,
+                            onCheckedChange = { isOn ->
+                                syncArmed = isOn
+                                SyncArm.set(context, isOn)
+                            }
+                        )
                     }
                 }
             }

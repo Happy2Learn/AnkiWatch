@@ -148,3 +148,24 @@ object FavoriteDecks {
     private fun prefs(context: android.content.Context) =
         context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
 }
+
+/**
+ * Phone-side arming switch for watch sync.
+ *
+ * When OFF, the phone ignores requests from the watch.
+ * Defaults to ON. Persisted in SharedPreferences across restarts.
+ */
+object SyncArm {
+    private const val PREFS = "settings"
+    private const val KEY = "sync_armed"
+
+    fun isOn(context: android.content.Context): Boolean =
+        prefs(context).getBoolean(KEY, true)
+
+    fun set(context: android.content.Context, on: Boolean) {
+        prefs(context).edit().putBoolean(KEY, on).apply()
+    }
+
+    private fun prefs(context: android.content.Context) =
+        context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
+}

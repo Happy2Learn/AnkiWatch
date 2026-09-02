@@ -67,6 +67,12 @@ class WearSyncService : WearableListenerService() {
             return
         }
 
+        // Check the switch fresh on every single message
+        if (!SyncArm.isOn(applicationContext)) {
+            Log.d(TAG, "Sync is OFF on phone; ignoring $path")
+            return
+        }
+
         when (path) {
             PATH_FETCH_DECKS -> scope.launch { pusher.pushDeckList() }
 
