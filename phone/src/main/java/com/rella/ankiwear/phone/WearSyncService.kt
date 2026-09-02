@@ -83,14 +83,12 @@ class WearSyncService : WearableListenerService() {
                 scope.launch { applyAndAck(listOf(grade)) }
             }
 
-            // The watch uploaded its queued grades.
+            // The watch uploaded its queued grades. Apply them, but do NOT
+            // push a new card list: restocking mid-review reset the watch to
+            // card 1 after every grade. Fresh cards only move on Sync.
             PATH_GRADE_QUEUE -> {
                 val grades = parseGradeQueue(String(messageEvent.data))
-                scope.launch {
-                    applyAndAck(grades)
-                    // Restock: "Again" cards may already be due again.
-                    pusher.pushCards(favoriteDeckIds())
-                }
+                scope.launch { applyAndAck(grades) }
             }
 
             // The watch tapped "Sync now": it will send its queue separately,

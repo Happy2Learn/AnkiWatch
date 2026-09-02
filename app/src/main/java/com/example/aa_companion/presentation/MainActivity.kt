@@ -94,6 +94,13 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
     private val stateMutex = Mutex()
 
     /**
+     * True between the user asking for a sync and the resulting card batch
+     * being applied. Incoming batches mid-review are ignored unless this is
+     * set, so a stray restock cannot reset the user to card 1.
+     */
+    @Volatile private var expectingSync = false
+
+    /**
      * Completes once the on-disk state has been restored. Anything that filters
      * cards must wait for this, or it may run with an empty grade queue and
      * show already-graded cards again.
@@ -133,8 +140,8 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
                 syncStatus = syncMessage,
                 onCardTap = { viewModel.flipToBack() },
                 onSyncClick = { syncNow() },
-                onGradeClick = { cardId, ease ->
-                    recordGrade(cardId, ease)
+                onGradeClick = { card, ease ->
+                    recordGrade(card, ease)
                     viewModel.nextCard()
                     cardShownAtMs = System.currentTimeMillis()
                 },
@@ -154,8 +161,6 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
             // unread, so pick it up explicitly. Batches already loaded are
             // ignored, so this cannot disturb an in-progress review.
             readStoredDataItems()
-            // If the phone is nearby, flush any queued grades right away.
-            uploadGradeQueueIfPossible()
         }
     }
 
@@ -231,9 +236,11 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
                     }
                 }
 
-                // Phone tapped "Sync now": send it whatever we have queued.
+                // Phone tapped "Sync now": send grades, then accept the card
+                // batch that will follow.
                 SYNC_REQUEST_PATH -> {
                     Log.d(TAG, "Phone requested our grade queue")
+                    expectingSync = true
                     CoroutineScope(Dispatchers.IO).launch {
                         restoreComplete.await()
                         uploadGradeQueueIfPossible()
@@ -267,20 +274,25 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
      * the review position and make one card repeat forever.
      */
     private suspend fun applyBatch(jsonString: String, batchTime: Long) {
+        val midReview = viewModel.cards.value.isNotEmpty() &&
+            viewModel.currentIndex.value < viewModel.cards.value.size
+        if (midReview && !expectingSync) {
+            Log.d(TAG, "Ignoring batch $batchTime; review in progress")
+            return
+        }
+
         val isNew = stateMutex.withLock {
             if (batchTime != 0L && batchTime <= loadedBatchTime) {
                 Log.d(TAG, "Ignoring batch $batchTime; already at $loadedBatchTime")
                 return@withLock false
             }
             loadedBatchTime = batchTime
-            // A new batch reflects the phone's latest view of what is due, so
-            // per-batch hiding starts over. Grades still awaiting upload keep
-            // their cards hidden via gradeQueue.
             gradedInBatch.clear()
             true
         }
         if (!isNew) return
 
+        expectingSync = false
         cacheCardsJson(jsonString)
         persistSession()
         showCards(jsonString)
@@ -296,9 +308,10 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
     private suspend fun showCards(jsonString: String) {
         try {
             val jsonArray = JSONArray(jsonString)
-            val hidden = stateMutex.withLock {
-                gradedInBatch + gradeQueue.map { it.cardId }
-            }
+            // Only Hard/Good/Easy hide a card for the rest of the batch.
+            // Again cards are intentionally left visible so they can reappear
+            // locally after a short delay.
+            val hidden = stateMutex.withLock { gradedInBatch.toSet() }
             val parsedList = mutableListOf<AnkiCard>()
 
             for (i in 0 until jsonArray.length()) {
@@ -374,22 +387,24 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
 
     // ---------- Grade queue (offline-first) ----------
 
-    private fun recordGrade(cardId: Long, ease: Int) {
+    private fun recordGrade(card: AnkiCard, ease: Int) {
         val timeTaken = (System.currentTimeMillis() - cardShownAtMs).coerceAtLeast(0)
-        val grade = QueuedGrade(cardId, ease, timeTaken, System.currentTimeMillis())
+        val grade = QueuedGrade(card.id, ease, timeTaken, System.currentTimeMillis())
+        val isAgain = ease == 1
+        if (isAgain) viewModel.scheduleAgain(card)
         CoroutineScope(Dispatchers.IO).launch {
             val pending = stateMutex.withLock {
                 gradeQueue.add(grade)
-                // Hide this card for the rest of the batch, independently of the
-                // upload queue, so an ack cannot make it reappear.
-                gradedInBatch.add(cardId)
+                // Again is not hidden: it will come back locally in ~10s.
+                // Hard/Good/Easy stay hidden for the rest of this batch.
+                if (!isAgain) gradedInBatch.add(card.id)
                 gradeQueue.size
             }
             withContext(Dispatchers.Main) { viewModel.setPendingGrades(pending) }
             saveGradeQueueToDisk()
             persistSession()
-            // Try to upload immediately; no-op if the phone is out of range.
-            uploadGradeQueueIfPossible()
+            // Grades stay queued until the user taps Sync. Uploading on every
+            // grade made the phone restock the card list and reset to card 1.
         }
     }
 
@@ -465,11 +480,13 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
      * a fresh batch. Requires the phone app to be open and in range.
      */
     private fun syncNow() {
+        expectingSync = true
         viewModel.setSyncStatus("Syncing...")
         CoroutineScope(Dispatchers.IO).launch {
             val reachable = isPhoneReachable()
             if (!reachable) {
-                CoroutineScope(Dispatchers.Main).launch {
+                expectingSync = false
+                withContext(Dispatchers.Main) {
                     viewModel.setSyncStatus("Phone not found. Open the Anki app on your phone.")
                 }
                 return@launch
@@ -555,7 +572,7 @@ fun WearTestScreen(
     syncStatus: String?,
     onCardTap: () -> Unit,
     onSyncClick: () -> Unit,
-    onGradeClick: (Long, Int) -> Unit,
+    onGradeClick: (AnkiCard, Int) -> Unit,
     onMediaClick: (Long) -> Unit
 ) {
     MaterialTheme {
@@ -634,16 +651,16 @@ fun WearTestScreen(
                                 horizontalArrangement = Arrangement.SpaceEvenly,
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                GradeButton("Again", Color(0xFFD32F2F)) { onGradeClick(currentCard.id, 1) }
-                                GradeButton("Hard", Color(0xFFFFA500)) { onGradeClick(currentCard.id, 2) }
+                                GradeButton("Again", Color(0xFFD32F2F)) { onGradeClick(currentCard, 1) }
+                                GradeButton("Hard", Color(0xFFFFA500)) { onGradeClick(currentCard, 2) }
                             }
                             Spacer(modifier = Modifier.height(6.dp))
                             Row(
                                 horizontalArrangement = Arrangement.SpaceEvenly,
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                GradeButton("Good", Color(0xFF00AA00)) { onGradeClick(currentCard.id, 3) }
-                                GradeButton("Easy", Color(0xFF1976D2)) { onGradeClick(currentCard.id, 4) }
+                                GradeButton("Good", Color(0xFF00AA00)) { onGradeClick(currentCard, 3) }
+                                GradeButton("Easy", Color(0xFF1976D2)) { onGradeClick(currentCard, 4) }
                             }
 
                             // Reachable mid-batch: scroll past the grade buttons
