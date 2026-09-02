@@ -23,10 +23,14 @@ import androidx.wear.compose.material.ButtonDefaults
 import androidx.wear.compose.material.MaterialTheme
 import androidx.wear.compose.material.Text
 import com.google.android.gms.wearable.*
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -68,15 +72,50 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
     private val gradeQueue = mutableListOf<QueuedGrade>()
     private var cardShownAtMs: Long = 0L
 
-    // Batch timestamp of the card buffer we've already loaded, so re-reading
-    // stored data items doesn't clobber in-progress review state.
+    /**
+     * Cards graded within the current batch, kept hidden even after the phone
+     * acknowledges them.
+     *
+     * [gradeQueue] alone is not enough: once a grade is acked it leaves the
+     * queue, and the card would reappear in the batch still on screen. This set
+     * is cleared only when a genuinely new batch arrives, at which point a card
+     * legitimately coming due again (e.g. graded "Again") should be shown.
+     */
+    private val gradedInBatch = mutableSetOf<Long>()
+
+    /**
+     * Timestamp of the batch currently loaded. Only strictly newer batches are
+     * applied, so waking the screen cannot reload the batch and throw the user
+     * back to card 1.
+     */
     private var loadedBatchTime: Long = 0L
+
+    /** Serializes all reads/writes of the review state above. */
+    private val stateMutex = Mutex()
+
+    /**
+     * Completes once the on-disk state has been restored. Anything that filters
+     * cards must wait for this, or it may run with an empty grade queue and
+     * show already-graded cards again.
+     */
+    private val restoreComplete = CompletableDeferred<Unit>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        loadCachedCardsOnBoot()
-        loadGradeQueueFromDisk()
+        // Strictly ordered: the grade queue and graded-set must be in memory
+        // before any card list is filtered, otherwise nothing gets hidden.
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                restoreSessionFromDisk()
+                restoreGradeQueueFromDisk()
+                loadCachedCards()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to restore saved state", e)
+            } finally {
+                restoreComplete.complete(Unit)
+            }
+        }
 
         setContent {
             val cards by viewModel.cards.collectAsState()
@@ -109,9 +148,11 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
         Wearable.getDataClient(this).addListener(this)
         cardShownAtMs = System.currentTimeMillis()
         CoroutineScope(Dispatchers.IO).launch {
+            restoreComplete.await()
             // onDataChanged only fires for *live* changes. Anything the phone
             // pushed while this app was closed is sitting in the data store
-            // unread, so pick it up explicitly on open.
+            // unread, so pick it up explicitly. Batches already loaded are
+            // ignored, so this cannot disturb an in-progress review.
             readStoredDataItems()
             // If the phone is nearby, flush any queued grades right away.
             uploadGradeQueueIfPossible()
@@ -133,9 +174,7 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
                     when (item.uri.path) {
                         RESPONSE_PATH ->
                             dataMap.getString("cards_json")?.let { json ->
-                                val batchTime = dataMap.getLong("batch_time", 0L)
-                                cacheCardsJson(json)
-                                parseAndLoadCards(json, batchTime)
+                                applyBatch(json, dataMap.getLong("batch_time", 0L))
                             }
 
                         GRADES_ACK_PATH ->
@@ -155,16 +194,18 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
 
     // ---------- Card loading ----------
 
-    private fun loadCachedCardsOnBoot() {
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val file = java.io.File(this@MainActivity.filesDir, "anki_cache.json")
-                if (file.exists()) {
-                    parseAndLoadCards(file.readText())
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to read from disk", e)
-            }
+    /**
+     * Restores the last batch from disk so the app works offline after a
+     * restart. Cards already graded are filtered out, so review resumes at the
+     * first card the user has not answered yet.
+     */
+    private suspend fun loadCachedCards() {
+        try {
+            val file = java.io.File(filesDir, "anki_cache.json")
+            if (!file.exists()) return
+            showCards(file.readText())
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to read cached cards", e)
         }
     }
 
@@ -176,19 +217,27 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
                 RESPONSE_PATH -> {
                     val jsonString = dataMap.getString("cards_json") ?: continue
                     val batchTime = dataMap.getLong("batch_time", 0L)
-                    CoroutineScope(Dispatchers.IO).launch { cacheCardsJson(jsonString) }
-                    parseAndLoadCards(jsonString, batchTime)
+                    CoroutineScope(Dispatchers.IO).launch {
+                        restoreComplete.await()
+                        applyBatch(jsonString, batchTime)
+                    }
                 }
 
                 GRADES_ACK_PATH -> {
                     val acked = dataMap.getString("acked_ids") ?: continue
-                    clearAckedGrades(acked)
+                    CoroutineScope(Dispatchers.IO).launch {
+                        restoreComplete.await()
+                        clearAckedGrades(acked)
+                    }
                 }
 
                 // Phone tapped "Sync now": send it whatever we have queued.
                 SYNC_REQUEST_PATH -> {
                     Log.d(TAG, "Phone requested our grade queue")
-                    CoroutineScope(Dispatchers.IO).launch { uploadGradeQueueIfPossible() }
+                    CoroutineScope(Dispatchers.IO).launch {
+                        restoreComplete.await()
+                        uploadGradeQueueIfPossible()
+                    }
                 }
             }
         }
@@ -210,18 +259,46 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
     }
 
     /**
-     * @param batchTime the phone's timestamp for this batch. Batches we've
-     *   already loaded are ignored so re-reading stored data items doesn't
-     *   reset the user's place mid-review. Pass 0 to force a load.
+     * Applies a batch pushed by the phone, if it is newer than what we have.
+     *
+     * Older or already-seen batches are ignored. This matters because
+     * DataClient retains data items indefinitely, so the same batch is re-read
+     * on every resume (including every screen wake); reapplying it would reset
+     * the review position and make one card repeat forever.
      */
-    private fun parseAndLoadCards(jsonString: String, batchTime: Long = 0L) {
-        if (batchTime != 0L && batchTime == loadedBatchTime) {
-            Log.d(TAG, "Ignoring already-loaded batch $batchTime")
-            return
+    private suspend fun applyBatch(jsonString: String, batchTime: Long) {
+        val isNew = stateMutex.withLock {
+            if (batchTime != 0L && batchTime <= loadedBatchTime) {
+                Log.d(TAG, "Ignoring batch $batchTime; already at $loadedBatchTime")
+                return@withLock false
+            }
+            loadedBatchTime = batchTime
+            // A new batch reflects the phone's latest view of what is due, so
+            // per-batch hiding starts over. Grades still awaiting upload keep
+            // their cards hidden via gradeQueue.
+            gradedInBatch.clear()
+            true
         }
+        if (!isNew) return
+
+        cacheCardsJson(jsonString)
+        persistSession()
+        showCards(jsonString)
+    }
+
+    /**
+     * Parses a card batch and shows the cards the user has not answered yet.
+     *
+     * Hidden cards are those graded in this batch ([gradedInBatch]) plus any
+     * still queued for upload ([gradeQueue]) — the latter guards against
+     * double-grading if the phone re-sends a card before processing the grade.
+     */
+    private suspend fun showCards(jsonString: String) {
         try {
             val jsonArray = JSONArray(jsonString)
-            val gradedIds = gradeQueue.map { it.cardId }.toSet()
+            val hidden = stateMutex.withLock {
+                gradedInBatch + gradeQueue.map { it.cardId }
+            }
             val parsedList = mutableListOf<AnkiCard>()
 
             for (i in 0 until jsonArray.length()) {
@@ -233,24 +310,65 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
                     frontHasMedia = getSafeBool(jsonObject, "frontHasMedia"),
                     backHasMedia = getSafeBool(jsonObject, "backHasMedia")
                 )
-                // "Don't repeat": cards already graded on the watch are hidden
-                // until the phone confirms them and sends a fresh batch.
-                if (card.id !in gradedIds) parsedList.add(card)
+                if (card.id !in hidden) parsedList.add(card)
             }
-            loadedBatchTime = batchTime
-            val skipped = jsonArray.length() - parsedList.size
-            CoroutineScope(Dispatchers.Main).launch {
+
+            val done = jsonArray.length() - parsedList.size
+            withContext(Dispatchers.Main) {
                 viewModel.updateCards(parsedList)
                 viewModel.setSyncStatus(
-                    if (skipped > 0) "Got ${parsedList.size} cards ($skipped already graded)"
-                    else "Got ${parsedList.size} cards"
+                    when {
+                        parsedList.isEmpty() && done > 0 -> "All $done cards done"
+                        done > 0 -> "${parsedList.size} to go ($done done)"
+                        else -> "${parsedList.size} cards ready"
+                    }
                 )
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to parse JSON", e)
-            CoroutineScope(Dispatchers.Main).launch {
+            Log.e(TAG, "Failed to parse card JSON", e)
+            withContext(Dispatchers.Main) {
                 viewModel.setSyncStatus("Couldn't read cards from phone")
             }
+        }
+    }
+
+    // ---------- Session persistence ----------
+
+    private fun sessionFile() = java.io.File(filesDir, "session.json")
+
+    /** Saves which batch is loaded and which of its cards are already graded. */
+    private suspend fun persistSession() {
+        try {
+            val json = stateMutex.withLock {
+                JSONObject().apply {
+                    put("batchTime", loadedBatchTime)
+                    put("gradedInBatch", JSONArray().apply {
+                        gradedInBatch.forEach { put(it) }
+                    })
+                }
+            }
+            sessionFile().writeText(json.toString())
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save session", e)
+        }
+    }
+
+    private suspend fun restoreSessionFromDisk() {
+        try {
+            val file = sessionFile()
+            if (!file.exists()) return
+            val obj = JSONObject(file.readText())
+            val batchTime = obj.optLong("batchTime", 0L)
+            val graded = obj.optJSONArray("gradedInBatch")
+            stateMutex.withLock {
+                loadedBatchTime = batchTime
+                gradedInBatch.clear()
+                if (graded != null) {
+                    for (i in 0 until graded.length()) gradedInBatch.add(graded.getLong(i))
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restore session", e)
         }
     }
 
@@ -259,40 +377,51 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
     private fun recordGrade(cardId: Long, ease: Int) {
         val timeTaken = (System.currentTimeMillis() - cardShownAtMs).coerceAtLeast(0)
         val grade = QueuedGrade(cardId, ease, timeTaken, System.currentTimeMillis())
-        gradeQueue.add(grade)
-        viewModel.setPendingGrades(gradeQueue.size)
-        saveGradeQueueToDisk()
-        // Try to upload immediately; no-op if the phone is out of range.
-        CoroutineScope(Dispatchers.IO).launch { uploadGradeQueueIfPossible() }
+        CoroutineScope(Dispatchers.IO).launch {
+            val pending = stateMutex.withLock {
+                gradeQueue.add(grade)
+                // Hide this card for the rest of the batch, independently of the
+                // upload queue, so an ack cannot make it reappear.
+                gradedInBatch.add(cardId)
+                gradeQueue.size
+            }
+            withContext(Dispatchers.Main) { viewModel.setPendingGrades(pending) }
+            saveGradeQueueToDisk()
+            persistSession()
+            // Try to upload immediately; no-op if the phone is out of range.
+            uploadGradeQueueIfPossible()
+        }
     }
 
     private fun gradeQueueFile() = java.io.File(filesDir, "grade_queue.json")
 
-    private fun saveGradeQueueToDisk() {
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val json = JSONArray()
-                gradeQueue.forEach { g ->
-                    json.put(JSONObject().apply {
-                        put("id", g.cardId)
-                        put("ease", g.ease)
-                        put("timeTaken", g.timeTakenMs)
-                        put("reviewedAt", g.reviewedAtMs)
-                    })
+    private suspend fun saveGradeQueueToDisk() {
+        try {
+            val json = stateMutex.withLock {
+                JSONArray().apply {
+                    gradeQueue.forEach { g ->
+                        put(JSONObject().apply {
+                            put("id", g.cardId)
+                            put("ease", g.ease)
+                            put("timeTaken", g.timeTakenMs)
+                            put("reviewedAt", g.reviewedAtMs)
+                        })
+                    }
                 }
-                gradeQueueFile().writeText(json.toString())
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to save grade queue", e)
             }
+            gradeQueueFile().writeText(json.toString())
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save grade queue", e)
         }
     }
 
-    private fun loadGradeQueueFromDisk() {
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val file = gradeQueueFile()
-                if (!file.exists()) return@launch
-                val array = JSONArray(file.readText())
+    private suspend fun restoreGradeQueueFromDisk() {
+        try {
+            val file = gradeQueueFile()
+            if (!file.exists()) return
+            val array = JSONArray(file.readText())
+            val pending = stateMutex.withLock {
+                gradeQueue.clear()
                 for (i in 0 until array.length()) {
                     val obj = array.getJSONObject(i)
                     gradeQueue.add(
@@ -304,25 +433,29 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
                         )
                     )
                 }
-                viewModel.setPendingGrades(gradeQueue.size)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to load grade queue", e)
+                gradeQueue.size
             }
+            withContext(Dispatchers.Main) { viewModel.setPendingGrades(pending) }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load grade queue", e)
         }
     }
 
     /** Sends the whole queue to the phone. The queue is only cleared after
      *  the phone acks (see [clearAckedGrades]), so nothing is ever lost. */
     private suspend fun uploadGradeQueueIfPossible() {
-        if (gradeQueue.isEmpty()) return
-        val json = JSONArray()
-        gradeQueue.forEach { g ->
-            json.put(JSONObject().apply {
-                put("id", g.cardId)
-                put("ease", g.ease)
-                put("timeTaken", g.timeTakenMs)
-                put("reviewedAt", g.reviewedAtMs)
-            })
+        val json = stateMutex.withLock {
+            if (gradeQueue.isEmpty()) return
+            JSONArray().apply {
+                gradeQueue.forEach { g ->
+                    put(JSONObject().apply {
+                        put("id", g.cardId)
+                        put("ease", g.ease)
+                        put("timeTaken", g.timeTakenMs)
+                        put("reviewedAt", g.reviewedAtMs)
+                    })
+                }
+            }
         }
         sendMessageToPhone("/wear/grade_queue", json.toString().toByteArray())
     }
@@ -356,14 +489,17 @@ class MainActivity : ComponentActivity(), DataClient.OnDataChangedListener {
         false
     }
 
-    private fun clearAckedGrades(ackedIdsJson: String) {
+    private suspend fun clearAckedGrades(ackedIdsJson: String) {
         try {
             val array = JSONArray(ackedIdsJson)
             val acked = (0 until array.length()).map { array.getLong(it) }.toSet()
-            gradeQueue.removeAll { it.cardId in acked }
-            viewModel.setPendingGrades(gradeQueue.size)
+            val pending = stateMutex.withLock {
+                gradeQueue.removeAll { it.cardId in acked }
+                gradeQueue.size
+            }
+            withContext(Dispatchers.Main) { viewModel.setPendingGrades(pending) }
             saveGradeQueueToDisk()
-            Log.d(TAG, "Cleared ${acked.size} acked grades; ${gradeQueue.size} pending")
+            Log.d(TAG, "Cleared ${acked.size} acked grades; $pending pending")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to clear acked grades", e)
         }
@@ -471,7 +607,7 @@ fun WearTestScreen(
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text(
-                            text = if (isShowingFront) "FRONT (${currentIndex + 1}/${cards.size})" else "BACK",
+                            text = "${currentIndex + 1} of ${cards.size}",
                             color = Color.Gray, fontSize = 10.sp, fontWeight = FontWeight.Bold
                         )
                         Spacer(modifier = Modifier.height(8.dp))
@@ -509,6 +645,18 @@ fun WearTestScreen(
                                 GradeButton("Good", Color(0xFF00AA00)) { onGradeClick(currentCard.id, 3) }
                                 GradeButton("Easy", Color(0xFF1976D2)) { onGradeClick(currentCard.id, 4) }
                             }
+
+                            // Reachable mid-batch: scroll past the grade buttons
+                            // to sync without finishing every card first.
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Button(
+                                onClick = onSyncClick,
+                                colors = ButtonDefaults.buttonColors(backgroundColor = Color.DarkGray)
+                            ) {
+                                Text("Sync", fontSize = 10.sp, color = Color.White)
+                            }
+                            SyncStatusText(syncStatus)
+                            Spacer(modifier = Modifier.height(8.dp))
                         }
                     }
                 }
